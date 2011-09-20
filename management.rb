@@ -5,7 +5,7 @@ require 'zmq'
 require 'crack'
 
 Thread.abort_on_exception = true
-$ctx = ZMQ::Context.new
+$ctx = ZMQ::Context.new(10)
 
 class Heartbeat
   attr_accessor :id, :thread, :base, :base_id, :port, :control_port, :attach
@@ -13,7 +13,7 @@ class Heartbeat
 	def initialize(args = {})
 		@id = args[:id] || Heartbeat.id
 		@thread = args[:inproc] || 'me'
-		@base = File.expand_path(args[:directory] || '/tmp/brothers')
+		@base = File.expand_path(args[:directory] || '/tmp/management_nodes')
 		@base_id = @base + "/#{@id}"
 		@port = args[:port] || Heartbeat.port
 		@control_port = args[:control_port] || Heartbeat.control_port
@@ -38,6 +38,7 @@ class Heartbeat
 	#Heartbeat
 	def announce
 		@attach = $ctx.socket(ZMQ::PUB)
+		@attach.setsockopt(ZMQ::HWM, 100)
 
 		if File.exists?(@base_id) == false
 			if File.directory?(@base) == false
@@ -47,33 +48,26 @@ class Heartbeat
 			@base_id = @base + "/#{@id}"
 		end
 
-		File.open(@base_id, 'w') {|f| f.write(Process.pid) }
-
-puts "BINDING TO PORT #{@port}"
-
 		counter = 0
 		begin
 			@attach.bind("ipc://#{@base_id}")
 			@attach.bind("inproc://#{@thread}")
 			Thread.new { @attach.bind("tcp://*:#{@port}") }
 		rescue => error
+			puts "#{@id.inspect} HEARTBEAT::ANNOUNCE LOOP::RESCUE: ERROR #{error} - COUNTER: #{counter}"
 			@port = Heartbeat.port
 			counter = counter + 1
-			raise unless counter > 10
+			raise unless counter > 11
 			retry
 		end
 
-puts "CREATING HEARTBEAT LOOP"
-
 		Thread.new do
 			loop do
-
-puts "IN HEARTBEAT LOOP"
-
-				@attach.send("{ 'id' : #{@id}, 'tcp' : #{@port}, 'file' : #{@base_id}, 'control_port' : #{@control_port} }")
-
-puts "SENT MY #{@id}"
-
+puts "#{@id.inspect} HEARTBEAT::ANNOUNCE LOOP::SENDING MESSAGES"
+				@attach.send('heartbeat', ZMQ::SNDMORE)
+puts "#{@id.inspect} HEARTBEAT::ANNOUNCE LOOP::TOPC SENT"
+				@attach.send("{ 'id' : #{@id}, 'pid' : #{Process.pid}, 'tcp' : #{@port}, 'file' : #{@base_id}, 'control_port' : #{@control_port} }")
+puts "#{@id.inspect} HEARTBEAT::ANNOUNCE LOOP::MESSAGE SENT"
 				sleep 1
 			end
 		end
@@ -81,39 +75,35 @@ puts "SENT MY #{@id}"
 
 	#Control Port
 	def responder
-
-puts "BINDING TO CONTROL PORT #{@control_port}"
-
 		Thread.new do
 			resp = $ctx.socket(ZMQ::REP)
 
-		counter = 0
-		begin
-			resp.bind("tcp://*:#{@control_port}")
-		rescue => error
-			@control_port = Heartbeat.control_port
-			counter = counter + 1
-			raise unless counter > 10
-			retry
-		end
+			counter = 0
+			begin
+				resp.bind("tcp://*:#{@control_port}")
+			rescue => error
+				puts "#{@id.inspect} HEARTBEAT::RESPONDER LOOP::RESCUE: ERROR:#{error} - COUNTER:#{counter}"
+				@control_port = Heartbeat.control_port
+				counter = counter + 1
+				raise unless counter > 11
+				retry
+			end
 
-			while message = resp.recv
-
-puts "IN WHILE LOOP to RESPOND TO REQUESTS"
-
-puts message
+			loop do
+puts "#{@id.inspect} HEARTBEAT::RESPONDER LOOP::WAITING FOR A MESSAGE"
+				message = resp.recv
+puts "#{@id.inspect} HEARTBEAT::RESPONDER LOOP::MESSAGE RECIEVED: #{message}"
 
 				case message
 				when "status?"
-puts					resp.send("running")
-
-puts "RESPONDED TO A REQUEST"
+					resp.send("running")
+puts "#{@id.inspect} HEARTBEAT::RESPONDER LOOP::SENT MESSAGE: RUNNING"
+				else
+					resp.send("Unknown request!")
+puts "#{@id.inspect} HEARTBEAT::RESPONDER LOOP::SENT MESSAGE: Unknown"
 				end
 			end
 		end
-
-puts "FINISHED AT CONTROL PORT - LOOP IS RUNNING"
-
 	end
 
 	def trap
@@ -123,104 +113,78 @@ puts "FINISHED AT CONTROL PORT - LOOP IS RUNNING"
 	end
 
 	def close
-		Thread.list.each do |t|
-			t.exit unless t == Thread.current
-		end
-
 		@attach.close
 	end
 end
 
 class Monitor
-  attr_accessor :id, :base, :attach, :results, :brothers, :connected_brothers
+  attr_accessor :id, :base, :attach, :results, :management_nodes, :connected_management_nodes
 
 	def initialize(args = {})
-		@base = File.expand_path(args[:directory] || '/tmp/brothers')
+		@base = File.expand_path(args[:directory] || '/tmp/management_nodes')
 		raise "I have no ID?" unless args[:id] != nil
 		@id = args[:id]
 		@attach = nil
 		@recieve_thread = nil
 		@results = Queue.new
-		@brothers = []
-		@connected_brothers = []
+		@management_nodes = []
+		@connected_management_nodes = []
 	end
 
 	#Do I need to duplicate myself?
-	def parse_brothers
-
-#puts @brothers.inspect
-#puts @connected_brothers.inspect
-
+	def parse_management_nodes
 		sleep 25
 
-		if @brothers == [] && @connected_brothers == []
-			b = Brother.new
+		if @management_nodes == [] && @connected_management_nodes == []
+			b = Management.new
 			b.duplicate
-
-puts "OKAY I CALLED A DUPLICATE LETs wait"
 
 			sleep 25
 		end
 	end
 
-	#Gather All Available Brothers
+	#Gather All Available Management Nodes
 	def gather
 		Thread.new do
 			loop do
-
-#puts "GATHERING BROTHERS"
-
-				temp_brothers = Dir[@base + '/**'].collect {|b| 'ipc://' + b}
-				temp_brothers.flatten!
-				temp_brothers.reject! { |a| a =~ /#{@id}/ }
-				new_temp_brothers = []
-				temp_brothers.each do |temp|
-
-#puts temp.inspect
-
-					if @connected_brothers.detect {|cb| cb == temp }
-
-#puts "FOUND"
-
+				temp_management_nodes = Dir[@base + '/**'].collect {|b| 'ipc://' + b}
+				temp_management_nodes.flatten!
+				temp_management_nodes.reject! { |a| a =~ /#{@id}/ }
+				new_temp_management_nodes = []
+				temp_management_nodes.each do |temp|
+					if @connected_management_nodes.detect {|cb| cb == temp }
 					else
-						new_temp_brothers << temp
+						new_temp_management_nodes << temp
 					end
 				end
 
-				@brothers = new_temp_brothers
+				@management_nodes = new_temp_management_nodes
 
-				self.parse_brothers
+				self.parse_management_nodes
 			end
 		end
 	end
 
-	#Connect to Brothers
+	#Connect to Management Nodes
 	def connect
-
-puts "CONNECTING TO BROTHERS"
-
 		@attach = $ctx.socket(ZMQ::SUB)
-		self.recieve
+		@attach.setsockopt(ZMQ::SUBSCRIBE,'heartbeat')
 
 		Thread.new do
 			loop do
 
-puts "IN CONECT TO BROTHERS LOOP"
-
 				begin
-					@brothers.each do |brother|
-
-puts "ATTACHING TO BROTHER #{brother}"
-
-						@attach.connect(brother)
-						@connected_brothers << brother
+					@management_nodes.each do |management_node|
+puts "#{@id.inspect} MONITOR::CONNECT LOOP::MANAGEMENT NODE CONNECTING TO: #{management_node}"
+						@attach.connect(management_node)
+						@connected_management_nodes << management_node
+						@management_nodes.delete(management_node)
 					end
 				rescue => error
 					puts error
-					puts "UNABLE TO BIND! to #{brother}"
+					puts "#{@id.inspect} MONITOR::CONNECT LOOP::UNABLE TO CONNECT TO: #{management_node}"
 				end
 
-puts "GOING TO SLEEP WHEN CONNECTED TO BROTHERS"
 				sleep 5
 			end
 		end
@@ -228,21 +192,22 @@ puts "GOING TO SLEEP WHEN CONNECTED TO BROTHERS"
 
 	#Recieve JSON data
 	def recieve
-
-puts "RECIEVING DATA"
-
 		Thread.new do
+			@pass = true
+
 			loop do
-				if @connected_brothers != []
+				if @connected_management_nodes != []
+puts "#{@id.inspect} MONITOR::RECIEVE LOOP::PASS IS: #{@pass.inspect}"
+					if @pass == false
+puts "#{@id.inspect} MONITOR::RECIEVE LOOP::GETTING HEARTBEAT MESSAGE"
+						message = @attach.recv
+puts "#{@id.inspect} MONITOR::RECIEVE LOOP::RECIEVED HEARTBEAT TOPIC MESSAGE"
+						message = @attach.recv if @attach.getsockopt(ZMQ::RCVMORE)
+puts "#{@id.inspect} MONITOR::RECIEVE LOOP::RECIEVED HEARTBEAT MESSAGE"
+						@results << message
+					end
 
-puts "GOT SOME CONNECTED BROTHERS"
-
-					message = @attach.recv
-
-puts "GOT A MESSAGE!!!!"
-puts message
-
-					@results << message
+					@pass = false
 				end
 			end
 		end
@@ -254,53 +219,41 @@ puts message
 			req = $ctx.socket(ZMQ::REQ)
 
 			loop do
-
-puts "GOING TO GET RESULTS..."
-
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::STARTED"
 				data = Crack::JSON.parse(@results.pop)
-
-puts "PROCESS DATA: #{data.inspect}"
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::PROCESS DATA: #{data.inspect}"
 
 				if data != nil
 					if data['control_port'] != nil
-
-puts "CONNECTING TO BROTHERs CONTROL PORT #{data['control_port']}"
-
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::CONTROL PORT CONNECT #{data['control_port']}"
 						req.connect("tcp://*:#{data['control_port']}")
-						req.send("status?")
-						@response = nil
-						response_thread = Thread.new { loop { @response = req.recv } }
+						sent = req.send("status?")
+						response = nil
+						response = req.recv if sent
 
-puts @response
-
-						case @response
+						case response
 						when "running"
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::RUNNING RESPONSE"
 							sleep 1
 						else
-							#dup
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::NO RESPONSE RECIEVED"
 						end
-
-						response_thread.exit
 					else
-						#dup
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::CONTROL PORT NIL: #{data['control_port'].inspect}"
 					end
 				else
-					#dup
+puts "#{@id.inspect} MONITOR::PROCESS LOOP::DATA BLANK: #{data.inspect}"
 				end
 			end
 		end
 	end
 
 	def close
-		Thread.list.each do |t|
-			t.exit unless t == Thread.current
-		end
-
 		@attach.close
 	end
 end
 
-class Brother
+class Management
   attr_accessor :self
 
 	def initialize(args = {})
@@ -313,6 +266,14 @@ class Brother
 		dup = Process.fork { exec @self }
 		Process.detach(dup)
 	end
+
+	def self.close
+		Thread.list.each do |t|
+			t.exit unless t == Thread.current
+		end
+
+		$ctx.terminate
+	end
 end
 
 if __FILE__ == $0
@@ -320,7 +281,7 @@ if __FILE__ == $0
 	hb.announce
 	hb.responder
 	##hb.trap
-	#
+
 	mon = Monitor.new({ :id => hb.id })
 	mon.gather
 	mon.connect
@@ -338,5 +299,5 @@ if __FILE__ == $0
 
 	mon.close
 	hb.close
-	$ctx.terminate
+	Management.close
 end

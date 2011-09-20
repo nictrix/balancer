@@ -7,13 +7,9 @@ Experimental Stuff
     rvm use ruby-1.9.2-p290@balancer
     bundle install
 
-## Running
-
-
-
 ## Goals
 
-* Order of Importance
+Order of Importance
 
 1. Create a management worker that can be self sufficient
 2. Management worker needs to be self sufficient in these areas: redundancy and scaling
